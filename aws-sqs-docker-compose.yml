@@ -5,14 +5,13 @@ services:
     image: localstack:sqs
     ports:
       - "4576:4576" # SQS
-      - "4888:4888" # Web UI dashboard
     environment:
       - SERVICES=sqs
       - DEBUG=0
-      - PORT_WEB_UI=4888
+      - DEFAULT_REGION=us-east-1
       - LAMBDA_EXECUTOR=local
       - KINESIS_ERROR_PROBABILITY=0
       - SQS_PORT_EXTERNAL=4576
     volumes:
-      - "./tmp:/tmp/localstack"
-
+      # localstack raises error on "permission deined" if using container disk
+      - ./var:/tmp/localstack
