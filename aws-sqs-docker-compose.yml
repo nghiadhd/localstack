@@ -1,0 +1,18 @@
+version: '2.1'
+
+services:
+  localstack:
+    image: localstack:sqs
+    ports:
+      - "4576:4576" # SQS
+      - "4888:4888" # Web UI dashboard
+    environment:
+      - SERVICES=sqs
+      - DEBUG=0
+      - PORT_WEB_UI=4888
+      - LAMBDA_EXECUTOR=local
+      - KINESIS_ERROR_PROBABILITY=0
+      - SQS_PORT_EXTERNAL=4576
+    volumes:
+      - "./tmp:/tmp/localstack"
+
