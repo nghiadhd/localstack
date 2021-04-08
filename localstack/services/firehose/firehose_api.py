@@ -6,15 +6,17 @@ import time
 import logging
 import base64
 import traceback
-from flask import Flask, jsonify, request
 from six import iteritems
-from localstack.constants import TEST_AWS_ACCOUNT_ID
-from localstack.services import generic_proxy
-from localstack.utils.common import short_uid, to_str
-from localstack.utils.aws import aws_responses
-from localstack.utils.aws.aws_stack import get_s3_client, firehose_stream_arn, connect_elasticsearch
+from flask import Flask, jsonify, request
 from boto3.dynamodb.types import TypeDeserializer
+from localstack.services import generic_proxy
+from localstack.constants import TEST_AWS_ACCOUNT_ID
+from localstack.utils.aws import aws_responses
+from localstack.utils.common import short_uid, to_str, timestamp
+from localstack.utils.aws.aws_stack import (
+    connect_to_resource, firehose_stream_arn, connect_elasticsearch, extract_region_from_auth_header)
 from localstack.utils.kinesis import kinesis_connector
+from localstack.utils.analytics import event_publisher
 
 APP_NAME = 'firehose_api'
 app = Flask(APP_NAME)
@@ -37,18 +39,32 @@ def get_delivery_stream_names():
     return names
 
 
+def get_delivery_stream_tags(stream_name, exclusive_start_tag_key=None, limit=50):
+    stream = DELIVERY_STREAMS[stream_name]
+    response = {}
+    start_i = -1
+    if exclusive_start_tag_key is not None:
+        start_i = next(iter([i for i, tag in enumerate(stream['Tags']) if tag['Key'] == exclusive_start_tag_key]))
+
+    response['Tags'] = [tag for i, tag in enumerate(stream['Tags']) if start_i < i < limit]
+    response['HasMore'] = len(response['Tags']) < len(stream['Tags'])
+    return response
+
+
 def put_record(stream_name, record):
     return put_records(stream_name, [record])
 
 
 def put_records(stream_name, records):
     stream = get_stream(stream_name)
+    if not stream:
+        return error_not_found(stream_name)
     for dest in stream['Destinations']:
         if 'ESDestinationDescription' in dest:
             es_dest = dest['ESDestinationDescription']
             es_index = es_dest['IndexName']
-            es_type = es_dest['TypeName']
-            es = connect_elasticsearch()
+            es_type = es_dest.get('TypeName')
+            es = connect_elasticsearch(endpoint=es_dest.get('ClusterEndpoint'), domain=es_dest.get('DomainARN'))
             for record in records:
                 obj_id = uuid.uuid4()
 
@@ -70,23 +86,31 @@ def put_records(stream_name, records):
             s3_dest = dest['S3DestinationDescription']
             bucket = bucket_name(s3_dest['BucketARN'])
             prefix = s3_dest.get('Prefix', '')
-            s3 = get_s3_client()
-            for record in records:
 
-                # DirectPut
-                if 'Data' in record:
-                    data = base64.b64decode(record['Data'])
-                # KinesisAsSource
-                elif 'data' in record:
-                    data = base64.b64decode(record['data'])
+            s3 = connect_to_resource('s3')
+            batched_data = b''.join(
+                [base64.b64decode(r.get('Data') or r['data']) for r in records])
 
-                obj_name = str(uuid.uuid4())
-                obj_path = '%s%s%s' % (prefix, '' if prefix.endswith('/') else '/', obj_name)
-                try:
-                    s3.Object(bucket, obj_path).put(Body=data)
-                except Exception as e:
-                    LOG.error('Unable to put record to stream: %s %s' % (e, traceback.format_exc()))
-                    raise e
+            obj_path = get_s3_object_path(stream_name, prefix)
+            try:
+                s3.Object(bucket, obj_path).put(Body=batched_data)
+            except Exception as e:
+                LOG.error('Unable to put record to stream: %s %s' % (e, traceback.format_exc()))
+                raise e
+    return {
+        'RecordId': str(uuid.uuid4())
+    }
+
+
+def get_s3_object_path(stream_name, prefix):
+    # See https://aws.amazon.com/kinesis/data-firehose/faqs/#Data_delivery
+    # Path prefix pattern: myApp/YYYY/MM/DD/HH/
+    # Object name pattern: DeliveryStreamName-DeliveryStreamVersion-YYYY-MM-DD-HH-MM-SS-RandomString
+    prefix = '%s%s' % (prefix, '' if prefix.endswith('/') else '/')
+    pattern = '{pre}%Y/%m/%d/%H/{name}-%Y-%m-%d-%H-%M-%S-{rand}'
+    path = pattern.format(pre=prefix, name=stream_name, rand=str(uuid.uuid4()))
+    path = timestamp(format=path)
+    return path
 
 
 def get_destination(stream_name, destination_id):
@@ -118,11 +142,12 @@ def update_destination(stream_name, destination_id,
 
 
 def process_records(records, shard_id, fh_d_stream):
-    put_records(fh_d_stream, records)
+    return put_records(fh_d_stream, records)
 
 
 def create_stream(stream_name, delivery_stream_type='DirectPut', delivery_stream_type_configuration=None,
-                  s3_destination=None, elasticsearch_destination=None):
+                  s3_destination=None, elasticsearch_destination=None, tags=None, region_name=None):
+    tags = tags or {}
     stream = {
         'DeliveryStreamType': delivery_stream_type,
         'KinesisStreamSourceConfiguration': delivery_stream_type_configuration,
@@ -132,23 +157,26 @@ def create_stream(stream_name, delivery_stream_type='DirectPut', delivery_stream
         'DeliveryStreamARN': firehose_stream_arn(stream_name),
         'DeliveryStreamStatus': 'ACTIVE',
         'DeliveryStreamName': stream_name,
-        'Destinations': []
+        'Destinations': [],
+        'Tags': tags
     }
     DELIVERY_STREAMS[stream_name] = stream
     if elasticsearch_destination:
-        update_destination(stream_name=stream_name,
-                           destination_id=short_uid(),
+        update_destination(stream_name=stream_name, destination_id=short_uid(),
                            elasticsearch_update=elasticsearch_destination)
     if s3_destination:
         update_destination(stream_name=stream_name, destination_id=short_uid(), s3_update=s3_destination)
 
+    # record event
+    event_publisher.fire_event(event_publisher.EVENT_FIREHOSE_CREATE_STREAM,
+        payload={'n': event_publisher.get_hash(stream_name)})
+
     if delivery_stream_type == 'KinesisStreamAsSource':
         kinesis_stream_name = delivery_stream_type_configuration.get('KinesisStreamARN').split('/')[1]
-        kinesis_connector.listen_to_kinesis(stream_name=kinesis_stream_name,
-                                            fh_d_stream=stream_name,
-                                            listener_func=process_records,
-                                            wait_until_started=True,
-                                            ddb_lease_table_suffix='-firehose')
+        kinesis_connector.listen_to_kinesis(
+            stream_name=kinesis_stream_name, fh_d_stream=stream_name,
+            listener_func=process_records, wait_until_started=True,
+            ddb_lease_table_suffix='-firehose', region_name=region_name)
     return stream
 
 
@@ -156,6 +184,11 @@ def delete_stream(stream_name):
     stream = DELIVERY_STREAMS.pop(stream_name, {})
     if not stream:
         return error_not_found(stream_name)
+
+    # record event
+    event_publisher.fire_event(event_publisher.EVENT_FIREHOSE_DELETE_STREAM,
+        payload={'n': event_publisher.get_hash(stream_name)})
+
     return {}
 
 
@@ -179,30 +212,38 @@ def error_not_found(stream_name):
 
 
 def error_response(msg, code=500, error_type='InternalFailure'):
-    return aws_responses.flask_error_response(msg, code=code, error_type=error_type)
+    return aws_responses.flask_error_response_json(msg, code=code, error_type=error_type)
 
 
 @app.route('/', methods=['POST'])
 def post_request():
-    action = request.headers.get('x-amz-target')
+    action = request.headers.get('x-amz-target', '')
+    action = action.split('.')[-1]
     data = json.loads(to_str(request.data))
     response = None
-    if action == '%s.ListDeliveryStreams' % ACTION_HEADER_PREFIX:
+
+    if action == 'ListDeliveryStreams':
         response = {
             'DeliveryStreamNames': get_delivery_stream_names(),
             'HasMoreDeliveryStreams': False
         }
-    elif action == '%s.CreateDeliveryStream' % ACTION_HEADER_PREFIX:
+    elif action == 'CreateDeliveryStream':
         stream_name = data['DeliveryStreamName']
-        response = create_stream(stream_name,
-                                 delivery_stream_type=data.get('DeliveryStreamType'),
-                                 delivery_stream_type_configuration=data.get('KinesisStreamSourceConfiguration'),
-                                 s3_destination=data.get('S3DestinationConfiguration'),
-                                 elasticsearch_destination=data.get('ElasticsearchDestinationConfiguration'))
-    elif action == '%s.DeleteDeliveryStream' % ACTION_HEADER_PREFIX:
+        region_name = extract_region_from_auth_header(request.headers)
+        _s3_destination = data.get('S3DestinationConfiguration') or data.get('ExtendedS3DestinationConfiguration')
+        response = create_stream(
+            stream_name,
+            delivery_stream_type=data.get('DeliveryStreamType'),
+            delivery_stream_type_configuration=data.get('KinesisStreamSourceConfiguration'),
+            s3_destination=_s3_destination,
+            elasticsearch_destination=data.get('ElasticsearchDestinationConfiguration'),
+            tags=data.get('Tags'),
+            region_name=region_name
+        )
+    elif action == 'DeleteDeliveryStream':
         stream_name = data['DeliveryStreamName']
         response = delete_stream(stream_name)
-    elif action == '%s.DescribeDeliveryStream' % ACTION_HEADER_PREFIX:
+    elif action == 'DescribeDeliveryStream':
         stream_name = data['DeliveryStreamName']
         response = get_stream(stream_name)
         if not response:
@@ -210,22 +251,22 @@ def post_request():
         response = {
             'DeliveryStreamDescription': response
         }
-    elif action == '%s.PutRecord' % ACTION_HEADER_PREFIX:
+    elif action == 'PutRecord':
         stream_name = data['DeliveryStreamName']
         record = data['Record']
-        put_record(stream_name, record)
-        response = {
-            'RecordId': str(uuid.uuid4())
-        }
-    elif action == '%s.PutRecordBatch' % ACTION_HEADER_PREFIX:
+        response = put_record(stream_name, record)
+    elif action == 'PutRecordBatch':
         stream_name = data['DeliveryStreamName']
         records = data['Records']
         put_records(stream_name, records)
+        request_responses = []
+        for i in records:
+            request_responses.append({'RecordId': str(uuid.uuid4())})
         response = {
             'FailedPutCount': 0,
-            'RequestResponses': []
+            'RequestResponses': request_responses
         }
-    elif action == '%s.UpdateDestination' % ACTION_HEADER_PREFIX:
+    elif action == 'UpdateDestination':
         stream_name = data['DeliveryStreamName']
         version_id = data['CurrentDeliveryStreamVersionId']
         destination_id = data['DestinationId']
@@ -234,8 +275,11 @@ def post_request():
                            s3_update=s3_update, version_id=version_id)
         es_update = data['ESDestinationUpdate'] if 'ESDestinationUpdate' in data else None
         update_destination(stream_name=stream_name, destination_id=destination_id,
-                           es_update=es_update, version_id=version_id)
+                           elasticsearch_update=es_update, version_id=version_id)
         response = {}
+    elif action == 'ListTagsForDeliveryStream':
+        response = get_delivery_stream_tags(data['DeliveryStreamName'], data.get('ExclusiveStartTagKey'),
+                                            data.get('Limit', 50))
     else:
         response = error_response('Unknown action "%s"' % action, code=400, error_type='InvalidAction')
 

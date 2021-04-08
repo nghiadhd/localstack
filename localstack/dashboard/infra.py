@@ -4,15 +4,17 @@ import json
 import logging
 import socket
 import tempfile
-from localstack.utils.common import (short_uid, parallelize, is_port_open,
-    rm_rf, unzip, download, clean_cache, mktime, load_file, mkdir, run, md5)
+from six import iteritems
+from localstack.config import DEFAULT_REGION
+from localstack.utils.aws import aws_stack
+from localstack.utils.common import (short_uid, parallelize, is_port_open, new_tmp_file,
+    to_str, rm_rf, unzip, download, clean_cache, mktime, load_file, mkdir, run, md5)
+from localstack.utils.bootstrap import is_api_enabled
 from localstack.utils.aws.aws_models import (ElasticSearch, S3Notification,
     EventSource, DynamoDB, DynamoDBStream, FirehoseStream, S3Bucket, SqsQueue,
     KinesisShard, KinesisStream, LambdaFunction)
-from localstack.utils.aws import aws_stack
-from localstack.utils.common import to_str
-from localstack.constants import REGION_LOCAL, DEFAULT_REGION
-from six import iteritems
+
+# TODO: CLI commands in this file need to be replaced with SDK calls!
 
 
 AWS_CACHE_TIMEOUT = 5  # 5 seconds
@@ -34,17 +36,27 @@ def run_cached(cmd, cache_duration_secs=None):
         cache_duration_secs = AWS_CACHE_TIMEOUT
     env_vars = os.environ.copy()
     env_vars.update({
-        'AWS_ACCESS_KEY_ID': os.environ.get('AWS_ACCESS_KEY_ID') or 'foobar',
-        'AWS_SECRET_ACCESS_KEY': os.environ.get('AWS_SECRET_ACCESS_KEY') or 'foobar',
-        'AWS_DEFAULT_REGION': os.environ.get('AWS_DEFAULT_REGION') or DEFAULT_REGION,
+        'AWS_ACCESS_KEY_ID': os.environ.get('AWS_ACCESS_KEY_ID') or 'test',
+        'AWS_SECRET_ACCESS_KEY': os.environ.get('AWS_SECRET_ACCESS_KEY') or 'test',
+        'AWS_DEFAULT_REGION': DEFAULT_REGION or os.environ.get('AWS_DEFAULT_REGION'),
         'PYTHONWARNINGS': 'ignore:Unverified HTTPS request'
     })
-    return run(cmd, cache_duration_secs=cache_duration_secs, env_vars=env_vars,
-               stderr=open(os.devnull, 'w'))
+    tmp_file_path = new_tmp_file()
+    error = None
+    with open(tmp_file_path, 'w') as err_file:
+        try:
+            return run(cmd, cache_duration_secs=cache_duration_secs, env_vars=env_vars, stderr=err_file)
+        except Exception as e:
+            error = e
+    if error:
+        LOG.warning('Error running command: %s %s %s' % (cmd, error, load_file(tmp_file_path)))
+        raise error
 
 
 def run_aws_cmd(service, cmd_params, env=None, cache_duration_secs=None):
     cmd = '%s %s' % (aws_cmd(service, env), cmd_params)
+    if not is_api_enabled(service):
+        return '{}'
     return run_cached(cmd, cache_duration_secs=cache_duration_secs)
 
 
@@ -84,14 +96,14 @@ def aws_cmd(service, env):
     cmd = '{ test `which aws` || . .venv/bin/activate; }; aws'
     endpoint_url = None
     env = aws_stack.get_environment(env)
-    if env.region == REGION_LOCAL:
+    if aws_stack.is_local_env(env):
         endpoint_url = aws_stack.get_local_service_url(service)
     if endpoint_url:
+        if not is_port_open(endpoint_url):
+            raise socket.error()
         if endpoint_url.startswith('https://'):
             cmd += ' --no-verify-ssl'
         cmd = '%s --endpoint-url="%s"' % (cmd, endpoint_url)
-        if not is_port_open(endpoint_url):
-            raise socket.error()
     cmd = '%s %s' % (cmd, service)
     return cmd
 
@@ -112,7 +124,7 @@ def get_kinesis_streams(filter='.*', pool={}, env=None):
                 pool[arn] = stream
                 stream.shards = get_kinesis_shards(stream_details=details, env=env)
                 result.append(stream)
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -140,12 +152,11 @@ def get_sqs_queues(filter='.*', pool={}, env=None):
         queues = json.loads(out)['QueueUrls']
         for q in queues:
             name = q.split('/')[-1]
-            account = q.split('/')[-2]
-            arn = 'arn:aws:sqs:%s:%s:%s' % (DEFAULT_REGION, account, name)
+            arn = aws_stack.sqs_queue_arn(name)
             if re.match(filter, name):
                 queue = SqsQueue(arn)
                 result.append(queue)
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -229,7 +240,7 @@ def get_lambda_functions(filter='.*', details=False, pool={}, env=None):
         out = cmd_lambda('list-functions', env)
         out = json.loads(out)
         parallelize(handle, out['Functions'])
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -251,7 +262,7 @@ def get_lambda_code(func_name, retries=1, cache_time=None, env=None):
     if MOCK_OBJ:
         return ''
     env = aws_stack.get_environment(env)
-    if cache_time is None and env.region != REGION_LOCAL:
+    if cache_time is None and not aws_stack.is_local_env(env):
         cache_time = AWS_LAMBDA_CODE_CACHE_TIMEOUT
     out = cmd_lambda('get-function --function-name %s' % func_name, env, cache_time)
     out = json.loads(out)
@@ -312,7 +323,7 @@ def get_elasticsearch_domains(filter='.*', pool={}, env=None):
                 result.append(es)
                 pool[arn] = es
         parallelize(handle, out['DomainNames'])
-    except socket.error:
+    except Exception:
         pass
 
     return result
@@ -336,7 +347,7 @@ def get_dynamo_dbs(filter='.*', pool={}, env=None):
                 result.append(db)
                 pool[arn] = db
         parallelize(handle, out['TableNames'])
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -369,7 +380,7 @@ def get_s3_buckets(filter='.*', pool={}, details=False, env=None):
         out = cmd_s3api('list-buckets', env)
         out = json.loads(out)
         parallelize(handle, out['Buckets'])
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -391,7 +402,7 @@ def get_firehose_streams(filter='.*', pool={}, env=None):
                     bucket = EventSource.get(dest_s3, pool=pool)
                     s.destinations.append(bucket)
                 result.append(s)
-    except socket.error:
+    except Exception:
         pass
     return result
 
@@ -405,87 +416,84 @@ def read_kinesis_iterator(shard_iterator, max_results=10, env=None):
 
 
 def get_kinesis_events(stream_name, shard_id, max_results=10, env=None):
-    env = aws_stack.get_environment(env)
-    records = aws_stack.kinesis_get_latest_records(stream_name, shard_id, count=max_results, env=env)
-    for r in records:
-        r['ApproximateArrivalTimestamp'] = mktime(r['ApproximateArrivalTimestamp'])
-    result = {
-        'events': records
-    }
+    records = []
+    try:
+        env = aws_stack.get_environment(env)
+        records = aws_stack.kinesis_get_latest_records(stream_name, shard_id, count=max_results, env=env)
+        for r in records:
+            r['ApproximateArrivalTimestamp'] = mktime(r['ApproximateArrivalTimestamp'])
+    except Exception:
+        pass
+    result = {'events': records}
     return result
 
 
-def get_graph(name_filter='.*', env=None):
+def get_graph(name_filter='.*', env=None, **kwargs):
     result = {
         'nodes': [],
         'edges': []
     }
 
     pool = {}
+    node_ids = {}
 
-    if True:
-        result = {
-            'nodes': [],
-            'edges': []
-        }
-        node_ids = {}
-        # Make sure we load components in the right order:
-        # (ES,DynamoDB,S3) -> (Kinesis,Lambda)
-        domains = get_elasticsearch_domains(name_filter, pool=pool, env=env)
-        dbs = get_dynamo_dbs(name_filter, pool=pool, env=env)
-        buckets = get_s3_buckets(name_filter, details=True, pool=pool, env=env)
-        streams = get_kinesis_streams(name_filter, pool=pool, env=env)
-        firehoses = get_firehose_streams(name_filter, pool=pool, env=env)
-        lambdas = get_lambda_functions(name_filter, details=True, pool=pool, env=env)
-        queues = get_sqs_queues(name_filter, pool=pool, env=env)
+    # Make sure we load components in the right order:
+    # (ES,DynamoDB,S3) -> (Kinesis,Lambda)
+    domains = get_elasticsearch_domains(name_filter, pool=pool, env=env)
+    dbs = get_dynamo_dbs(name_filter, pool=pool, env=env)
+    buckets = get_s3_buckets(name_filter, details=True, pool=pool, env=env)
+    streams = get_kinesis_streams(name_filter, pool=pool, env=env)
+    firehoses = get_firehose_streams(name_filter, pool=pool, env=env)
+    lambdas = get_lambda_functions(name_filter, details=True, pool=pool, env=env)
+    queues = get_sqs_queues(name_filter, pool=pool, env=env)
 
-        for es in domains:
-            uid = short_uid()
-            node_ids[es.id] = uid
-            result['nodes'].append({'id': uid, 'arn': es.id, 'name': es.name(), 'type': 'es'})
-        for b in buckets:
-            uid = short_uid()
-            node_ids[b.id] = uid
-            result['nodes'].append({'id': uid, 'arn': b.id, 'name': b.name(), 'type': 's3'})
-        for db in dbs:
-            uid = short_uid()
-            node_ids[db.id] = uid
-            result['nodes'].append({'id': uid, 'arn': db.id, 'name': db.name(), 'type': 'dynamodb'})
-        for s in streams:
-            uid = short_uid()
-            node_ids[s.id] = uid
-            result['nodes'].append({'id': uid, 'arn': s.id, 'name': s.name(), 'type': 'kinesis'})
-            for shard in s.shards:
-                uid1 = short_uid()
-                name = re.sub(r'shardId-0*', '', shard.id) or '0'
-                result['nodes'].append({'id': uid1, 'arn': shard.id, 'name': name,
-                    'type': 'kinesis_shard', 'streamName': s.name(), 'parent': uid})
-        for f in firehoses:
-            uid = short_uid()
-            node_ids[f.id] = uid
-            result['nodes'].append({'id': uid, 'arn': f.id, 'name': f.name(), 'type': 'firehose'})
-            for d in f.destinations:
-                result['edges'].append({'source': uid, 'target': node_ids[d.id]})
-        for q in queues:
-            uid = short_uid()
-            node_ids[q.id] = uid
-            result['nodes'].append({'id': uid, 'arn': q.id, 'name': q.name(), 'type': 'sqs'})
-        for l in lambdas:
-            uid = short_uid()
-            node_ids[l.id] = uid
-            result['nodes'].append({'id': uid, 'arn': l.id, 'name': l.name(), 'type': 'lambda'})
-            for s in l.event_sources:
-                lookup_id = s.id
-                if isinstance(s, DynamoDBStream):
-                    lookup_id = s.table.id
-                result['edges'].append({'source': node_ids.get(lookup_id), 'target': uid})
-            for t in l.targets:
-                lookup_id = t.id
-                result['edges'].append({'source': uid, 'target': node_ids.get(lookup_id)})
-        for b in buckets:
-            for n in b.notifications:
-                src_uid = node_ids[b.id]
-                tgt_uid = node_ids[n.target.id]
-                result['edges'].append({'source': src_uid, 'target': tgt_uid})
+    for es in domains:
+        uid = short_uid()
+        node_ids[es.id] = uid
+        result['nodes'].append({'id': uid, 'arn': es.id, 'name': es.name(), 'type': 'es'})
+    for b in buckets:
+        uid = short_uid()
+        node_ids[b.id] = uid
+        result['nodes'].append({'id': uid, 'arn': b.id, 'name': b.name(), 'type': 's3'})
+    for db in dbs:
+        uid = short_uid()
+        node_ids[db.id] = uid
+        result['nodes'].append({'id': uid, 'arn': db.id, 'name': db.name(), 'type': 'dynamodb'})
+    for s in streams:
+        uid = short_uid()
+        node_ids[s.id] = uid
+        result['nodes'].append({'id': uid, 'arn': s.id, 'name': s.name(), 'type': 'kinesis'})
+        for shard in s.shards:
+            uid1 = short_uid()
+            name = re.sub(r'shardId-0*', '', shard.id) or '0'
+            result['nodes'].append({'id': uid1, 'arn': shard.id, 'name': name,
+                'type': 'kinesis_shard', 'streamName': s.name(), 'parent': uid})
+    for f in firehoses:
+        uid = short_uid()
+        node_ids[f.id] = uid
+        result['nodes'].append({'id': uid, 'arn': f.id, 'name': f.name(), 'type': 'firehose'})
+        for d in f.destinations:
+            result['edges'].append({'source': uid, 'target': node_ids[d.id]})
+    for q in queues:
+        uid = short_uid()
+        node_ids[q.id] = uid
+        result['nodes'].append({'id': uid, 'arn': q.id, 'name': q.name(), 'type': 'sqs'})
+    for lda in lambdas:
+        uid = short_uid()
+        node_ids[lda.id] = uid
+        result['nodes'].append({'id': uid, 'arn': lda.id, 'name': lda.name(), 'type': 'lambda'})
+        for s in lda.event_sources:
+            lookup_id = s.id
+            if isinstance(s, DynamoDBStream):
+                lookup_id = s.table.id
+            result['edges'].append({'source': node_ids.get(lookup_id), 'target': uid})
+        for t in lda.targets:
+            lookup_id = t.id
+            result['edges'].append({'source': uid, 'target': node_ids.get(lookup_id)})
+    for b in buckets:
+        for n in b.notifications:
+            src_uid = node_ids[b.id]
+            tgt_uid = node_ids[n.target.id]
+            result['edges'].append({'source': src_uid, 'target': tgt_uid})
 
     return result

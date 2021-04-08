@@ -1,8 +1,8 @@
-from __future__ import print_function
-
+from localstack.utils.common import timestamp_millis
 import time
 import json
 import six
+from datetime import datetime
 
 if six.PY3:
     long = int
@@ -76,7 +76,7 @@ class KinesisStream(Component):
                         print(next_entry['Records'][0]['Data'])
                     record = next_entry
             except Exception as e:
-                print('Error reading from Kinesis stream "%s": %s' (self.stream_name, e))
+                print('Error reading from Kinesis stream "%s": %s' % (self.stream_name, e))
 
     def wait_for(self):
         GET_STATUS_SLEEP_SECS = 5
@@ -156,6 +156,16 @@ class FirehoseStream(KinesisStream):
         return self.id.split(':deliverystream/')[-1]
 
 
+class CodeSigningConfig():
+    def __init__(self, arn, id, signing_profile_version_arns):
+        self.arn = arn
+        self.id = id
+        self.signing_profile_version_arns = signing_profile_version_arns
+        self.description = ''
+        self.untrusted_artifact_on_deployment = 'Warn'
+        self.last_modified = None
+
+
 class LambdaFunction(Component):
     def __init__(self, arn):
         super(LambdaFunction, self).__init__(arn)
@@ -164,18 +174,135 @@ class LambdaFunction(Component):
         self.versions = {}
         self.aliases = {}
         self.envvars = {}
+        self.tags = {}
         self.concurrency = None
         self.runtime = None
         self.handler = None
         self.cwd = None
         self.timeout = None
+        self.last_modified = None
+        self.vpc_config = None
+        self.role = None
+        self.kms_key_arn = None
+        self.memory_size = None
+        self.code = None
+        self.dead_letter_config = None
+        self.on_successful_invocation = None
+        self.on_failed_invocation = None
+        self.max_retry_attempts = None
+        self.max_event_age = None
+        self.description = ''
+        self.code_signing_config_arn = None
+        self.package_type = None
+        self.image_config = {}
+
+    def set_dead_letter_config(self, data):
+        config = data.get('DeadLetterConfig')
+        if not config:
+            return
+        self.dead_letter_config = config
+        target_arn = config.get('TargetArn') or ''
+        if ':sqs:' not in target_arn and ':sns:' not in target_arn:
+            raise Exception('Dead letter queue ARN "%s" requires a valid SQS queue or SNS topic' % target_arn)
+
+    def get_function_event_invoke_config(self):
+        response = {}
+
+        if self.max_retry_attempts:
+            response.update({'MaximumRetryAttempts': self.max_retry_attempts})
+
+        if self.max_event_age:
+            response.update({'MaximumEventAgeInSeconds': self.max_event_age})
+
+        if self.on_successful_invocation or self.on_failed_invocation:
+            response.update({'DestinationConfig': {}})
+            if self.on_successful_invocation:
+                response['DestinationConfig'].update({
+                    'OnSuccess': {
+                        'Destination': self.on_successful_invocation
+                    }
+                })
+            if self.on_failed_invocation:
+                response['DestinationConfig'].update({
+                    'OnFailure': {
+                        'Destination': self.on_failed_invocation
+                    }
+                })
+        if not response:
+            return None
+        response.update({
+            'LastModified': timestamp_millis(self.last_modified),
+            'FunctionArn': str(self.id),
+        })
+        return response
+
+    def clear_function_event_invoke_config(self):
+        if hasattr(self, 'dead_letter_config'):
+            self.dead_letter_config = None
+        if hasattr(self, 'on_successful_invocation'):
+            self.on_successful_invocation = None
+        if hasattr(self, 'on_failed_invocation'):
+            self.on_failed_invocation = None
+        if hasattr(self, 'max_retry_attempts'):
+            self.max_retry_attempts = None
+        if hasattr(self, 'max_event_age'):
+            self.max_event_age = None
+
+    def put_function_event_invoke_config(self, data):
+        if not isinstance(data, dict):
+            return
+
+        updated = False
+        if 'DestinationConfig' in data:
+            if 'OnFailure' in data['DestinationConfig']:
+                dlq_arn = data['DestinationConfig']['OnFailure']['Destination']
+                self.on_failed_invocation = dlq_arn
+                updated = True
+
+            if 'OnSuccess' in data['DestinationConfig']:
+                sq_arn = data['DestinationConfig']['OnSuccess']['Destination']
+                self.on_successful_invocation = sq_arn
+                updated = True
+
+        if 'MaximumRetryAttempts' in data:
+            try:
+                max_retry_attempts = int(data['MaximumRetryAttempts'])
+            except Exception:
+                max_retry_attempts = 3
+
+            self.max_retry_attempts = max_retry_attempts
+            updated = True
+
+        if 'MaximumEventAgeInSeconds' in data:
+            try:
+                max_event_age = int(data['MaximumEventAgeInSeconds'])
+            except Exception:
+                max_event_age = 3600
+
+            self.max_event_age = max_event_age
+            updated = True
+
+        if updated:
+            self.last_modified = datetime.utcnow()
+
+        return self
+
+    def destination_enabled(self):
+        return self.on_successful_invocation is not None or self.on_failed_invocation is not None
 
     def get_version(self, version):
         return self.versions.get(version)
 
+    def max_version(self):
+        versions = [int(key) for key in self.versions.keys() if key != '$LATEST']
+        return versions and max(versions) or 0
+
     def name(self):
         # Example ARN: arn:aws:lambda:aws-region:acct-id:function:helloworld:1
         return self.id.split(':')[6]
+
+    def region(self):
+        return self.id.split(':')[3]
 
     def arn(self):
         return self.id
@@ -279,7 +406,7 @@ class EventSource(Component):
         inst = None
         if obj.startswith('arn:aws:kinesis:'):
             inst = KinesisStream(obj)
-        if obj.startswith('arn:aws:lambda:'):
+        elif obj.startswith('arn:aws:lambda:'):
             inst = LambdaFunction(obj)
         elif obj.startswith('arn:aws:dynamodb:'):
             if '/stream/' in obj:

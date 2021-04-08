@@ -1,10 +1,10 @@
 import json
-import uuid
-import hashlib
+import time
 from flask import Flask, jsonify, request, make_response
 from localstack.services import generic_proxy
 from localstack.utils.aws import aws_stack
-from localstack.utils.common import to_str
+from localstack.utils.common import to_str, now_utc
+from localstack.utils.analytics import event_publisher
 
 APP_NAME = 'ddb_streams_api'
 
@@ -19,21 +19,30 @@ ACTION_HEADER_PREFIX = 'DynamoDBStreams_20120810'
 SEQUENCE_NUMBER_COUNTER = 1
 
 
-def add_dynamodb_stream(table_name, view_type='NEW_AND_OLD_IMAGES', enabled=True):
+def add_dynamodb_stream(table_name, latest_stream_label=None, view_type='NEW_AND_OLD_IMAGES', enabled=True):
     if enabled:
         # create kinesis stream as a backend
         stream_name = get_kinesis_stream_name(table_name)
         aws_stack.create_kinesis_stream(stream_name)
+        latest_stream_label = latest_stream_label or 'latest'
         stream = {
-            'StreamArn': aws_stack.dynamodb_stream_arn(table_name=table_name),
+            'StreamArn': aws_stack.dynamodb_stream_arn(
+                table_name=table_name, latest_stream_label=latest_stream_label),
             'TableName': table_name,
-            'StreamLabel': 'TODO',
+            'StreamLabel': latest_stream_label,
             'StreamStatus': 'ENABLED',
             'KeySchema': [],
             'Shards': []
         }
         table_arn = aws_stack.dynamodb_table_arn(table_name)
         DDB_STREAMS[table_arn] = stream
+        # record event
+        event_publisher.fire_event(event_publisher.EVENT_DYNAMODB_CREATE_STREAM,
+            payload={'n': event_publisher.get_hash(table_name)})
+
+
+def get_stream_for_table(table_arn):
+    return DDB_STREAMS.get(table_arn)
 
 
 def forward_events(records):
@@ -44,25 +53,40 @@ def forward_events(records):
             record['dynamodb']['SequenceNumber'] = str(SEQUENCE_NUMBER_COUNTER)
             SEQUENCE_NUMBER_COUNTER += 1
         table_arn = record['eventSourceARN']
-        stream = DDB_STREAMS.get(table_arn)
+        stream = get_stream_for_table(table_arn)
         if stream:
             table_name = table_name_from_stream_arn(stream['StreamArn'])
             stream_name = get_kinesis_stream_name(table_name)
             kinesis.put_record(StreamName=stream_name, Data=json.dumps(record), PartitionKey='TODO')
 
 
+def delete_streams(table_arn):
+    table_arn = aws_stack.dynamodb_table_arn(table_arn)
+    stream = DDB_STREAMS.pop(table_arn, None)
+    if stream:
+        table_name = table_arn.split('/')[-1]
+        stream_name = get_kinesis_stream_name(table_name)
+        try:
+            aws_stack.connect_to_service('kinesis').delete_stream(StreamName=stream_name)
+            # sleep a bit, as stream deletion can take some time ...
+            time.sleep(1)
+        except Exception:
+            pass  # ignore "stream not found" errors
+
+
 @app.route('/', methods=['POST'])
 def post_request():
-    action = request.headers.get('x-amz-target')
+    action = request.headers.get('x-amz-target', '')
+    action = action.split('.')[-1]
     data = json.loads(to_str(request.data))
     result = {}
     kinesis = aws_stack.connect_to_service('kinesis')
-    if action == '%s.ListStreams' % ACTION_HEADER_PREFIX:
+    if action == 'ListStreams':
         result = {
-            'Streams': list(DDB_STREAMS.values()),
-            'LastEvaluatedStreamArn': 'TODO'
+            'Streams': list(DDB_STREAMS.values())
         }
-    elif action == '%s.DescribeStream' % ACTION_HEADER_PREFIX:
+
+    elif action == 'DescribeStream':
         for stream in DDB_STREAMS.values():
             if stream['StreamArn'] == data['StreamArn']:
                 result = {
@@ -85,17 +109,23 @@ def post_request():
                 break
         if not result:
             return error_response('Requested resource not found', error_type='ResourceNotFoundException')
-    elif action == '%s.GetShardIterator' % ACTION_HEADER_PREFIX:
+
+    elif action == 'GetShardIterator':
         # forward request to Kinesis API
         stream_name = stream_name_from_stream_arn(data['StreamArn'])
         stream_shard_id = kinesis_shard_id(data['ShardId'])
-        result = kinesis.get_shard_iterator(StreamName=stream_name,
-            ShardId=stream_shard_id, ShardIteratorType=data['ShardIteratorType'])
-    elif action == '%s.GetRecords' % ACTION_HEADER_PREFIX:
+
+        kwargs = {'StartingSequenceNumber': data['SequenceNumber']} if data.get('SequenceNumber') else {}
+        result = kinesis.get_shard_iterator(StreamName=stream_name, ShardId=stream_shard_id,
+                                            ShardIteratorType=data['ShardIteratorType'], **kwargs)
+
+    elif action == 'GetRecords':
         kinesis_records = kinesis.get_records(**data)
-        result = {'Records': []}
+        result = {'Records': [], 'NextShardIterator': kinesis_records.get('NextShardIterator')}
         for record in kinesis_records['Records']:
-            result['Records'].append(json.loads(to_str(record['Data'])))
+            record_data = json.loads(to_str(record['Data']))
+            record_data['dynamodb']['SequenceNumber'] = record['SequenceNumber']
+            result['Records'].append(record_data)
     else:
         print('WARNING: Unknown operation "%s"' % action)
     return jsonify(result)
@@ -132,17 +162,17 @@ def stream_name_from_stream_arn(stream_arn):
     return get_kinesis_stream_name(table_name)
 
 
-def random_id(stream_arn, kinesis_shard_id):
-    namespace = uuid.UUID(bytes=hashlib.sha1(stream_arn.encode('utf-8')).digest()[:16])
-    return uuid.uuid5(namespace, kinesis_shard_id.encode('utf-8')).hex
-
-
 def shard_id(stream_arn, kinesis_shard_id):
-    return '-'.join([kinesis_shard_id, random_id(stream_arn, kinesis_shard_id)])
+    timestamp = str(now_utc())
+    timestamp = '%s00000000' % timestamp[:-5]
+    timestamp = '%s%s' % ('0' * (20 - len(timestamp)), timestamp)
+    suffix = kinesis_shard_id.replace('shardId-', '')[:32]
+    return 'shardId-%s-%s' % (timestamp, suffix)
 
 
 def kinesis_shard_id(dynamodbstream_shard_id):
-    return dynamodbstream_shard_id.rsplit('-', 1)[0]
+    shard_params = dynamodbstream_shard_id.rsplit('-')
+    return '{0}-{1}'.format(shard_params[0], shard_params[-1])
 
 
 def serve(port, quiet=True):

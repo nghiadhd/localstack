@@ -1,27 +1,33 @@
 import logging
 import traceback
-from localstack.config import PORT_KINESIS, DATA_DIR
-from localstack.constants import DEFAULT_PORT_KINESIS_BACKEND
+from localstack import config
 from localstack.utils.aws import aws_stack
-from localstack.utils.common import mkdir
+from localstack.utils.common import mkdir, get_free_tcp_port
 from localstack.services import install
-from localstack.services.infra import get_service_protocol, start_proxy_for_service, do_run
+from localstack.services.infra import start_proxy_for_service, do_run, log_startup_message
 from localstack.services.install import ROOT_PATH
 
 LOGGER = logging.getLogger(__name__)
 
 
-def start_kinesis(port=PORT_KINESIS, asynchronous=False, shard_limit=100, update_listener=None):
+def start_kinesis(port=None, asynchronous=False, update_listener=None):
+    port = port or config.PORT_KINESIS
     install.install_kinesalite()
-    backend_port = DEFAULT_PORT_KINESIS_BACKEND
+    backend_port = get_free_tcp_port()
+    latency = config.KINESIS_LATENCY
     kinesis_data_dir_param = ''
-    if DATA_DIR:
-        kinesis_data_dir = '%s/kinesis' % DATA_DIR
+    if config.DATA_DIR:
+        kinesis_data_dir = '%s/kinesis' % config.DATA_DIR
         mkdir(kinesis_data_dir)
         kinesis_data_dir_param = '--path %s' % kinesis_data_dir
-    cmd = ('%s/node_modules/kinesalite/cli.js --shardLimit %s --port %s %s' %
-        (ROOT_PATH, shard_limit, backend_port, kinesis_data_dir_param))
-    print('Starting mock Kinesis (%s port %s)...' % (get_service_protocol(), port))
+    cmd = (
+        '%s/node_modules/kinesalite/cli.js --shardLimit %s --port %s'
+        ' --createStreamMs %s --deleteStreamMs %s --updateStreamMs %s %s'
+    ) % (
+        ROOT_PATH, config.KINESIS_SHARD_LIMIT, backend_port,
+        latency, latency, latency, kinesis_data_dir_param
+    )
+    log_startup_message('Kinesis')
     start_proxy_for_service('kinesis', port, backend_port, update_listener)
     return do_run(cmd, asynchronous)
 
